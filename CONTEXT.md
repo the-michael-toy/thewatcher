@@ -129,16 +129,29 @@ set the color; the other stops explain where a problem starts.
   so a link that is always slow becomes its own normal. After that, samples
   taken while the dot is orange or red are kept out of the baseline.
 - **Locating the problem:**
-  - Red is placed at the nearest stop losing at least half its recent pings.
+  - Red is placed at the nearest stop losing at least half the pings sent
+    since the internet stopped answering. Pings from before the outage don't
+    count.
   - Orange loss is placed at the nearest stop losing at a comparable rate over
     the same stretch of time.
-  - Slowness is placed on the Wi-Fi link when the router itself is slow
+  - Slowness is placed at the router hop when the router itself is slow
     compared with its own baseline.
+  - A silent or slow router means either the Mac's own link or the router
+    itself. In a mesh, the router stop is the main node, and the node the Mac
+    talks to relays without showing up on the path. The text names both and
+    never blames the link alone.
 
 ## Places and history
 
-A place is identified by its router's hardware address, read from the ARP
-table. No permission is needed for that.
+A place is identified by its router's hardware address. No permission is
+needed for that.
+
+- It is read from the system's record of the primary network service
+  (`ARPResolvedHardwareAddress` under `State:/Network/Service/<id>/IPv4`).
+  macOS 27 hides the ARP table and neighbor addresses from ordinary apps, but
+  not this record.
+- Wired and Wi-Fi on the same network report the same router address, so
+  they are the same place.
 
 - The address stays the same anywhere on one network: a mesh has one router,
   and its satellites only relay Wi-Fi. Moving between eero nodes in different
@@ -163,8 +176,7 @@ and the learned baselines, because they say nothing about the new network.
 
 ## Code layout
 
-- `Sources/CNetStat`: C shim over the kernel statistics socket, plus the ARP
-  lookup.
+- `Sources/CNetStat`: C shim over the kernel statistics socket.
 - `Sources/WatcherCore`: everything testable without a UI.
   - `Pinger`: the ICMP socket.
   - `PathDiscovery`: router, fingerprint, traceroute, and choosing the stops.

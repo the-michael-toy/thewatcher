@@ -4,6 +4,12 @@ import Testing
 struct PathTests {
     let router = IPv4("192.168.4.1")!
 
+    @Test func hardwareAddressMatchesTheStoredForm() {
+        #expect(PathDiscovery.normalizedHardwareAddress("c4:a8:16:2a:9c:54") == "c4:a8:16:2a:9c:54")
+        #expect(PathDiscovery.normalizedHardwareAddress("C4:A8:6:2a:9:54") == "c4:a8:06:2a:09:54")
+        #expect(PathDiscovery.normalizedHardwareAddress("c4:a8:16:2a:9c") == nil)
+    }
+
     @Test func homeWithMeshBehindISPRouter() {
         let hops: [IPv4?] = [IPv4("192.168.4.1"), IPv4("192.168.1.254"), IPv4("203.0.113.1"), IPv4("198.51.100.7"), nil, IPv4("1.1.1.1")]
         let stops = PathDiscovery.selectStops(router: router, hops: hops)

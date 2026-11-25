@@ -1,4 +1,3 @@
-import CNetStat
 import Darwin
 import Foundation
 import SystemConfiguration
@@ -8,23 +7,32 @@ public enum PathDiscovery {
     /// internet as down only when both stop answering.
     public static let farHosts: [IPv4] = [IPv4("1.1.1.1")!, IPv4("8.8.8.8")!]
 
-    /// The Mac's current IPv4 router and the interface that reaches it.
-    public static func currentRouter() -> (router: IPv4, interface: String)? {
+    /// The Mac's current IPv4 router, the interface that reaches it, and the
+    /// router's hardware address. The address comes from the system's record
+    /// of the primary service, because macOS hides the ARP table from apps.
+    public static func currentRouter() -> (router: IPv4, interface: String, hardwareAddress: String?)? {
         guard let store = SCDynamicStoreCreate(nil, "TheWatcher" as CFString, nil, nil),
-              let value = SCDynamicStoreCopyValue(store, "State:/Network/Global/IPv4" as CFString) as? [String: Any],
-              let routerText = value["Router"] as? String,
+              let global = SCDynamicStoreCopyValue(store, "State:/Network/Global/IPv4" as CFString) as? [String: Any],
+              let routerText = global["Router"] as? String,
               let router = IPv4(routerText),
-              let interface = value["PrimaryInterface"] as? String
+              let interface = global["PrimaryInterface"] as? String
         else { return nil }
-        return (router, interface)
+        var hardwareAddress: String?
+        if let service = global["PrimaryService"] as? String,
+           let ipv4 = SCDynamicStoreCopyValue(store, "State:/Network/Service/\(service)/IPv4" as CFString) as? [String: Any],
+           (ipv4["ARPResolvedIPAddress"] as? String).flatMap(IPv4.init) == router,
+           let text = ipv4["ARPResolvedHardwareAddress"] as? String {
+            hardwareAddress = normalizedHardwareAddress(text)
+        }
+        return (router, interface, hardwareAddress)
     }
 
-    public static func hardwareAddress(of address: IPv4) -> String? {
-        var mac = [UInt8](repeating: 0, count: 6)
-        let addr = in_addr(s_addr: address.value.bigEndian)
-        let rc = mac.withUnsafeMutableBufferPointer { cn_arp_lookup(addr, $0.baseAddress) }
-        guard rc == 0 else { return nil }
-        return mac.map { String(format: "%02x", $0) }.joined(separator: ":")
+    /// Six lowercase two-digit hex octets joined by colons, the form places
+    /// are stored under; nil for anything else.
+    static func normalizedHardwareAddress(_ text: String) -> String? {
+        let octets = text.split(separator: ":", omittingEmptySubsequences: false).map { UInt8($0, radix: 16) }
+        guard octets.count == 6, !octets.contains(nil) else { return nil }
+        return octets.map { String(format: "%02x", $0!) }.joined(separator: ":")
     }
 
     /// Hop-by-hop route toward `destination`, one entry per hop limit; nil
@@ -67,13 +75,7 @@ public enum PathDiscovery {
     }
 
     public static func discover(connection: Connection) async -> NetworkPath? {
-        guard let (router, interface) = currentRouter() else { return nil }
-        var fingerprint = hardwareAddress(of: router)
-        if fingerprint == nil, let pinger = try? Pinger() {
-            // An ARP entry exists only after recent traffic to the router.
-            _ = await pinger.ping(router, timeout: 1)
-            fingerprint = hardwareAddress(of: router)
-        }
+        guard let (router, interface, fingerprint) = currentRouter() else { return nil }
         let hops = await trace(to: farHosts[0])
         return NetworkPath(
             connection: connection,

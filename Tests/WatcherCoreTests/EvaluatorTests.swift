@@ -58,6 +58,22 @@ struct EvaluatorTests {
         #expect(Evaluator.assess(snapshot(probes)).headline == "Can't reach your router.")
     }
 
+    @Test func goodPingsBeforeTheOutageDoNotHideTheRouter() {
+        let before: [Double?] = Array(repeating: 3, count: 7)
+        let probes = series(.internet, Array(repeating: 17, count: 7) + [nil, nil, nil])
+            + series(.router, before + [nil, nil, nil])
+            + series(.upstream, before + [nil, nil, nil])
+            + series(.isp, before + [nil, nil, nil])
+        #expect(Evaluator.assess(snapshot(probes)).headline == "Can't reach your router.")
+    }
+
+    @Test func unreachableRouterDoesNotBlameWiFiAlone() {
+        let probes = series(.internet, [nil, nil, nil, nil]) + series(.router, [nil, nil, nil, nil])
+        let detail = Evaluator.assess(snapshot(probes)).detail ?? ""
+        #expect(detail.contains("Wi-Fi"))
+        #expect(detail.contains("router itself"))
+    }
+
     @Test func pingsComingBackEndRedAtOnce() {
         let probes = series(.internet, [17, nil, nil, nil, nil, 17])
         let outage = Outage(startEarliest: now.addingTimeInterval(-5), startLatest: now.addingTimeInterval(-4), end: now)

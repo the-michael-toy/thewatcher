@@ -70,10 +70,10 @@ public enum Evaluator {
         // Red: nothing gets through.
         let trailingLost = far.reversed().prefix { $0.lost }.count
         if trailingLost >= outageRun {
-            let since = s.outage.flatMap { $0.end == nil ? $0.startMidpoint : nil }
-                ?? far[far.count - trailingLost].time
+            let failingSince = far[far.count - trailingLost].time
+            let since = s.outage.flatMap { $0.end == nil ? $0.startMidpoint : nil } ?? failingSince
             let down = "Down for \(Format.duration(s.now.timeIntervalSince(since)))."
-            let (headline, detail) = locateOutage(s, link: link)
+            let (headline, detail) = locateOutage(s, since: failingSince, link: link)
             return Assessment(light: .red, headline: headline, detail: "\(detail) \(down)", wantsFastPace: true)
         }
 
@@ -100,7 +100,7 @@ public enum Evaluator {
             return Assessment(light: .yellow, headline: "A ping to the internet went missing. Checking…",
                               detail: nil, wantsFastPace: true)
         }
-        if let blip = recentBlip(s, far: far, threshold: threshold, link: link) {
+        if let blip = recentBlip(s, far: far, threshold: threshold) {
             let fast = blip.wasLoss && s.now.timeIntervalSince(blip.time) <= fastPaceMemory
             return Assessment(light: .yellow,
                               headline: "There was a blip \(Format.ago(s.now.timeIntervalSince(blip.time))); it looks fine now.",
@@ -114,15 +114,23 @@ public enum Evaluator {
 
     // MARK: - Where is it?
 
-    static func locateOutage(_ s: Snapshot, link: String) -> (String, String) {
-        if failing(s, .router) {
-            return ("Can't reach your router.", "The problem is your \(link) connection.")
+    /// Each stop is judged only by pings sent since the internet stopped
+    /// answering; pings from before would dilute a stop that went dark with it.
+    static func locateOutage(_ s: Snapshot, since: Date, link: String) -> (String, String) {
+        func failing(_ role: StopRole) -> Bool {
+            let during = s.probes.filter { $0.role == role && $0.time >= since }.suffix(10)
+            return during.count >= 2 && Double(during.filter(\.lost).count) / Double(during.count) >= 0.5
         }
-        if failing(s, .upstream) {
+        // A silent router can't tell the Mac's own link from the router or,
+        // in a mesh, the node relaying for it.
+        if failing(.router) {
+            return ("Can't reach your router.", "Either your \(link) connection or the router itself stopped passing traffic.")
+        }
+        if failing(.upstream) {
             return ("Your router can't reach the upstream router.",
                     "Likely the cable between them or the ISP's box.")
         }
-        if failing(s, .isp) {
+        if failing(.isp) {
             return ("Your ISP's line looks down.", "Your \(link) and router are fine.")
         }
         return ("Nothing beyond your ISP is answering.", "Your \(link), router and ISP's line look fine.")
@@ -136,7 +144,7 @@ public enum Evaluator {
             let lost = window.filter(\.lost).count
             if window.count >= 3, lost > 0, Double(lost) / Double(window.count) >= farRate / 2 {
                 switch stop.role {
-                case .router: return "It starts at your \(link) connection."
+                case .router: return "It starts at your \(link) connection or the router itself."
                 case .upstream: return "It starts between your router and the upstream router."
                 case .isp: return "It starts at your ISP's line. Your \(link) and router look fine."
                 case .internet: break
@@ -149,21 +157,9 @@ public enum Evaluator {
     static func locateSlowness(_ s: Snapshot, link: String) -> String {
         let routerOK = s.probes.filter { $0.role == .router && !$0.lost }.suffix(3).compactMap(\.ms)
         if routerOK.count >= 3, let m = median(routerOK), let slow = s.routerBaseline.slowThresholdMs, m > slow {
-            return "Your \(link) link to the router is slow too, so it starts there."
+            return "Your router is slow to answer too, so it starts at your \(link) connection or the router itself."
         }
         return "Your \(link) and router look fine."
-    }
-
-    /// Fraction of a stop's last ten pings in the past minute that were lost;
-    /// nil when there are too few to judge.
-    static func lossRate(_ s: Snapshot, _ role: StopRole) -> Double? {
-        let recent = s.probes.filter { $0.role == role && s.now.timeIntervalSince($0.time) <= 60 }.suffix(10)
-        guard recent.count >= 3 else { return nil }
-        return Double(recent.filter(\.lost).count) / Double(recent.count)
-    }
-
-    static func failing(_ s: Snapshot, _ role: StopRole) -> Bool {
-        lossRate(s, role).map { $0 >= 0.5 } ?? false
     }
 
     /// Lost pings in short runs that have ended. A long run is an outage, and
@@ -186,7 +182,7 @@ public enum Evaluator {
     }
 
     /// The most significant trouble inside the yellow memory window.
-    static func recentBlip(_ s: Snapshot, far: [Probe], threshold: Double?, link: String) -> Blip? {
+    static func recentBlip(_ s: Snapshot, far: [Probe], threshold: Double?) -> Blip? {
         let window = { (t: Date) in s.now.timeIntervalSince(t) <= memory }
         if let o = s.outage, let end = o.end, window(end) {
             return Blip(time: end, what: "The connection was down for \(Format.duration(o.duration(asOf: end))).")
@@ -198,7 +194,7 @@ public enum Evaluator {
             return Blip(time: spike.time, what: "Latency spiked to \(Format.ms(spike.ms!)).", wasLoss: false)
         }
         if let lost = s.probes.last(where: { $0.role == .router && $0.lost && window($0.time) }) {
-            return Blip(time: lost.time, what: "Your \(link) connection dropped a ping.")
+            return Blip(time: lost.time, what: "A ping to your router was lost.")
         }
         if let burst = s.traffic.last(where: { $0.isResendBurst && window($0.time) }) {
             return Blip(time: burst.time, what: "Your apps had to resend data on several connections at once.")

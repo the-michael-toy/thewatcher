@@ -2,7 +2,6 @@
 #define CNETSTAT_H
 
 #include <stdint.h>
-#include <netinet/in.h>
 
 /// Totals across this Mac's TCP connections that carry traffic over a real
 /// network interface (Wi-Fi, Ethernet, cellular), for the interval since the
@@ -24,9 +23,5 @@ void cn_close(cn_ctx *ctx);
 /// Fills *out with totals since the previous call. Returns 0 or an errno.
 /// The first call after cn_open establishes the starting point and reports zeros.
 int cn_sample_now(cn_ctx *ctx, cn_sample *out);
-
-/// Reads the hardware address the ARP table holds for an IPv4 address.
-/// Returns 0 on success, ENOENT when no entry exists.
-int cn_arp_lookup(struct in_addr addr, uint8_t mac_out[6]);
 
 #endif

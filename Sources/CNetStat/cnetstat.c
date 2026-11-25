@@ -11,11 +11,8 @@
 #include <unistd.h>
 #include <sys/ioctl.h>
 #include <sys/socket.h>
-#include <sys/sysctl.h>
 #include <sys/kern_control.h>
 #include <sys/sys_domain.h>
-#include <net/if_dl.h>
-#include <net/route.h>
 #include <netinet/if_ether.h>
 
 #define PRIVATE 1
@@ -282,32 +279,4 @@ int cn_sample_now(cn_ctx *c, cn_sample *out) {
     }
     *out = c->acc;
     return 0;
-}
-
-int cn_arp_lookup(struct in_addr target, uint8_t mac_out[6]) {
-    int mib[6] = { CTL_NET, PF_ROUTE, 0, AF_INET, NET_RT_FLAGS, RTF_LLINFO };
-    size_t len = 0;
-    if (sysctl(mib, 6, NULL, &len, NULL, 0) < 0) return errno;
-    if (len == 0) return ENOENT;
-    char *buf = malloc(len);
-    if (!buf) return ENOMEM;
-    if (sysctl(mib, 6, buf, &len, NULL, 0) < 0) { int e = errno; free(buf); return e; }
-    int result = ENOENT;
-    for (char *p = buf; p < buf + len;) {
-        struct rt_msghdr *rtm = (struct rt_msghdr *)p;
-        if (rtm->rtm_msglen == 0) break;
-        struct sockaddr_in *sin = (struct sockaddr_in *)(rtm + 1);
-        struct sockaddr_dl *sdl = (struct sockaddr_dl *)((char *)sin + (sin->sin_len > 0
-            ? ((sin->sin_len + sizeof(uint32_t) - 1) & ~(sizeof(uint32_t) - 1))
-            : sizeof(uint32_t)));
-        if (sin->sin_family == AF_INET && sin->sin_addr.s_addr == target.s_addr
-            && sdl->sdl_family == AF_LINK && sdl->sdl_alen == 6) {
-            memcpy(mac_out, LLADDR(sdl), 6);
-            result = 0;
-            break;
-        }
-        p += rtm->rtm_msglen;
-    }
-    free(buf);
-    return result;
 }
