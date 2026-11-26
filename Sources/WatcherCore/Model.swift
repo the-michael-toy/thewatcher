@@ -103,14 +103,15 @@ public enum Light: Int, Comparable, Sendable, Codable {
     case yellow = 2
     /// Slow or losing pings right now.
     case orange = 3
-    /// Nothing is getting through.
+    /// Significant problems between this Mac and the internet right now.
     case red = 4
 
     public static func < (l: Light, r: Light) -> Bool { l.rawValue < r.rawValue }
 }
 
-/// An outage whose start is known only to within a range: between the last
-/// moment something got through and the first moment it provably didn't.
+/// A stretch of significant problems (a red dot), whose start is known only
+/// to within a range: between the last probe before the trouble and the
+/// first probe that showed it.
 public struct Outage: Equatable, Sendable {
     public var startEarliest: Date
     public var startLatest: Date

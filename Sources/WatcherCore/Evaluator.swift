@@ -11,14 +11,13 @@ public struct Snapshot: Sendable {
     public var probes: [Probe]
     /// Recent seconds of this Mac's own traffic, oldest first.
     public var traffic: [TrafficSample]
-    public var farBaseline: Baseline
-    public var routerBaseline: Baseline
+    public var baselines: [StopRole: Baseline]
     /// The ongoing outage, or the most recent one.
     public var outage: Outage?
 
     public init(now: Date, connected: Bool = true, captive: Bool = false, connection: Connection = .wifi,
                 stops: [Stop] = [], probes: [Probe] = [], traffic: [TrafficSample] = [],
-                farBaseline: Baseline = Baseline(), routerBaseline: Baseline = Baseline(), outage: Outage? = nil) {
+                baselines: [StopRole: Baseline] = [:], outage: Outage? = nil) {
         self.now = now
         self.connected = connected
         self.captive = captive
@@ -26,10 +25,11 @@ public struct Snapshot: Sendable {
         self.stops = stops
         self.probes = probes
         self.traffic = traffic
-        self.farBaseline = farBaseline
-        self.routerBaseline = routerBaseline
+        self.baselines = baselines
         self.outage = outage
     }
+
+    func baseline(_ role: StopRole) -> Baseline { baselines[role] ?? Baseline() }
 }
 
 public struct Assessment: Equatable, Sendable {
@@ -38,23 +38,33 @@ public struct Assessment: Equatable, Sendable {
     public let detail: String?
     /// Ping once a second until things settle.
     public let wantsFastPace: Bool
+    /// For red: the first probe that showed the trouble.
+    public var troubleStarted: Date? = nil
 }
 
 /// Turns recent measurements into the dot's color and the sentence that
-/// explains it. Only the far hosts set the color; the stops in between
-/// explain where a problem starts.
+/// explains it. Only the far hosts set the color. Every symptom is then placed
+/// by the same rule: the nearest stop showing it beyond its own normal.
 public enum Evaluator {
     /// Consecutive lost internet pings that mean nothing is getting through.
     static let outageRun = 3
+    /// Every symptom is judged over the same recent stretch of internet pings.
+    static let windowPings = 20
+    static let windowSpan: TimeInterval = 180
+    /// Losing this share of recent internet pings is a significant problem.
+    static let redLossShare = 0.25
     /// How long a cleared problem keeps the dot yellow.
     static let memory: TimeInterval = 5 * 60
     /// How long after a lost ping to keep pinging once a second.
     static let fastPaceMemory: TimeInterval = 30
+    /// This many answered internet pings in a row mean the loss has stopped.
+    static let lossClearsAfter = 5
+    /// Latency is judged on the last few answered pings within this span.
+    static let latencySpan: TimeInterval = 120
 
     public static func assess(_ s: Snapshot) -> Assessment {
         let far = s.probes.filter { $0.role == .internet }
         let link = s.connection == .hotspot ? "hotspot" : s.connection.rawValue
-        let threshold = s.farBaseline.slowThresholdMs
 
         guard s.connected else {
             return Assessment(light: .gray, headline: "Not connected to a network.", detail: nil, wantsFastPace: false)
@@ -67,40 +77,61 @@ public enum Evaluator {
             return Assessment(light: .gray, headline: "Checking the connection…", detail: nil, wantsFastPace: true)
         }
 
-        // Red: nothing gets through.
+        let window = Array(far.filter { s.now.timeIntervalSince($0.time) <= windowSpan }.suffix(windowPings))
+        let windowStart = window.first?.time ?? s.now
         let trailingLost = far.reversed().prefix { $0.lost }.count
+
+        // Nothing gets through.
         if trailingLost >= outageRun {
             let failingSince = far[far.count - trailingLost].time
-            let since = s.outage.flatMap { $0.end == nil ? $0.startMidpoint : nil } ?? failingSince
-            let down = "Down for \(Format.duration(s.now.timeIntervalSince(since)))."
-            let (headline, detail) = locateOutage(s, since: failingSince, link: link)
-            return Assessment(light: .red, headline: headline, detail: "\(detail) \(down)", wantsFastPace: true)
+            let place = locateLoss(s, since: failingSince)
+            let started = lossRuns(window) > 1 ? window.first(where: \.lost)?.time ?? failingSince : failingSince
+            let detail = "\(whereDetail(place, s, link: link)) Nothing has answered for \(Format.duration(s.now.timeIntervalSince(failingSince)))."
+            return Assessment(light: .red, headline: downHeadline(place, s), detail: detail, wantsFastPace: true,
+                              troubleStarted: started)
         }
 
-        // Orange: working, but badly, right now.
-        let recentFar = Array(far.filter { s.now.timeIntervalSince($0.time) <= 180 }.suffix(20))
-        let scattered = lossesOutsideOutages(recentFar)
-        if scattered >= 2 {
-            let oneIn = max(2, Int((Double(recentFar.count) / Double(scattered)).rounded()))
-            let farRate = Double(scattered) / Double(recentFar.count)
-            return Assessment(light: .orange, headline: "Losing about 1 in \(oneIn) pings to the internet.",
-                              detail: locateLoss(s, since: recentFar[0].time, farRate: farRate, link: link),
-                              wantsFastPace: true)
+        // Losing pings: more than one run of loss, and still happening. A
+        // single run that has ended is a blip.
+        var losing: Assessment?
+        let trailingAnswered = far.reversed().prefix { !$0.lost }.count
+        if lossRuns(window) > 1 && trailingAnswered < lossClearsAfter {
+            let share = Double(window.filter(\.lost).count) / Double(window.count)
+            let place = locateLoss(s, since: windowStart)
+            let pings = s.probes.filter { $0.role == place && $0.time >= windowStart }
+            let headline = "\(subject(place, s)) is losing \(pings.filter(\.lost).count) of the last \(pings.count) pings."
+            let red = share >= redLossShare
+            losing = Assessment(light: red ? .red : .orange, headline: headline,
+                                detail: whereDetail(place, s, link: link), wantsFastPace: true,
+                                troubleStarted: red ? window.first(where: \.lost)?.time : nil)
         }
-        let recentOK = far.filter { !$0.lost && s.now.timeIntervalSince($0.time) <= 120 }.suffix(5).compactMap(\.ms)
-        // Slowness measures fine at the normal pace; only loss needs timing to the second.
-        if recentOK.count >= 3, let threshold, let current = median(recentOK), current > threshold {
-            let usual = s.farBaseline.median.map { ", usually \(Format.ms($0))" } ?? ""
-            return Assessment(light: .orange, headline: "The internet is slow: \(Format.ms(current))\(usual).",
-                              detail: locateSlowness(s, link: link), wantsFastPace: false)
+
+        // Slow. Slowness alone measures fine at the normal pace; only loss needs timing to the second.
+        var slow: Assessment?
+        let farBaseline = s.baseline(.internet)
+        let answered = recentAnswered(.internet, s)
+        if answered.count >= 3, let threshold = farBaseline.slowThresholdMs,
+           let current = median(answered.compactMap(\.ms)), current > threshold {
+            let red = current > (farBaseline.verySlowThresholdMs ?? .infinity)
+            let place = locateSlowness(s)
+            let ms = place == .internet ? current : median(recentAnswered(place, s).suffix(3).compactMap(\.ms)) ?? current
+            let usual = s.baseline(place).median.map { ", usually \(Format.ms($0))" } ?? ""
+            let firstSlow = answered.first { ($0.ms ?? 0) > threshold }?.time
+            slow = Assessment(light: red ? .red : .orange, headline: "\(subject(place, s)) is slow: \(Format.ms(ms))\(usual).",
+                              detail: whereDetail(place, s, link: link), wantsFastPace: losing != nil,
+                              troubleStarted: red ? firstSlow : nil)
         }
+
+        // Whichever is worse speaks; loss wins a tie.
+        if let losing, losing.light >= (slow?.light ?? .gray) { return losing }
+        if let slow { return slow }
 
         // Yellow: trouble that is unconfirmed or has cleared.
         if trailingLost > 0 {
             return Assessment(light: .yellow, headline: "A ping to the internet went missing. Checking…",
                               detail: nil, wantsFastPace: true)
         }
-        if let blip = recentBlip(s, far: far, threshold: threshold) {
+        if let blip = recentBlip(s, far: far, threshold: farBaseline.slowThresholdMs) {
             let fast = blip.wasLoss && s.now.timeIntervalSince(blip.time) <= fastPaceMemory
             return Assessment(light: .yellow,
                               headline: "There was a blip \(Format.ago(s.now.timeIntervalSince(blip.time))); it looks fine now.",
@@ -114,65 +145,76 @@ public enum Evaluator {
 
     // MARK: - Where is it?
 
-    /// Each stop is judged only by pings sent since the internet stopped
-    /// answering; pings from before would dilute a stop that went dark with it.
-    static func locateOutage(_ s: Snapshot, since: Date, link: String) -> (String, String) {
-        func failing(_ role: StopRole) -> Bool {
-            let during = s.probes.filter { $0.role == role && $0.time >= since }.suffix(10)
-            return during.count >= 2 && Double(during.filter(\.lost).count) / Double(during.count) >= 0.5
+    /// The nearest stop whose loss beyond its usual loss is at least half the
+    /// internet's loss, over the same stretch of time.
+    static func locateLoss(_ s: Snapshot, since: Date) -> StopRole {
+        func share(_ role: StopRole) -> Double? {
+            let pings = s.probes.filter { $0.role == role && $0.time >= since }
+            guard pings.count >= 2 else { return nil }
+            return Double(pings.filter(\.lost).count) / Double(pings.count)
         }
-        // A silent router can't tell the Mac's own link from the router or,
-        // in a mesh, the node relaying for it.
-        if failing(.router) {
-            return ("Can't reach your router.", "Either your \(link) connection or the router itself stopped passing traffic.")
-        }
-        if failing(.upstream) {
-            return ("Your router can't reach the upstream router.",
-                    "Likely the cable between them or the ISP's box.")
-        }
-        if failing(.isp) {
-            return ("Your ISP's line looks down.", "Your \(link) and router are fine.")
-        }
-        return ("Nothing beyond your ISP is answering.", "Your \(link), router and ISP's line look fine.")
-    }
-
-    /// The nearest stop losing pings at a comparable rate over the same stretch
-    /// of time is where the loss starts.
-    static func locateLoss(_ s: Snapshot, since: Date, farRate: Double, link: String) -> String {
+        let farShare = share(.internet) ?? 0
         for stop in s.stops where stop.role != .internet {
-            let window = s.probes.filter { $0.role == stop.role && $0.time >= since }
-            let lost = window.filter(\.lost).count
-            if window.count >= 3, lost > 0, Double(lost) / Double(window.count) >= farRate / 2 {
-                switch stop.role {
-                case .router: return "It starts at your \(link) connection or the router itself."
-                case .upstream: return "It starts between your router and the upstream router."
-                case .isp: return "It starts at your ISP's line. Your \(link) and router look fine."
-                case .internet: break
-                }
+            if let e = share(stop.role).map({ $0 - s.baseline(stop.role).usualLoss }), e > 0, e >= farShare / 2 {
+                return stop.role
             }
         }
-        return "Your \(link) and router look fine."
+        return .internet
     }
 
-    static func locateSlowness(_ s: Snapshot, link: String) -> String {
-        let routerOK = s.probes.filter { $0.role == .router && !$0.lost }.suffix(3).compactMap(\.ms)
-        if routerOK.count >= 3, let m = median(routerOK), let slow = s.routerBaseline.slowThresholdMs, m > slow {
-            return "Your router is slow to answer too, so it starts at your \(link) connection or the router itself."
-        }
-        return "Your \(link) and router look fine."
-    }
-
-    /// Lost pings in short runs that have ended. A long run is an outage, and
-    /// a run still going is unconfirmed: it ends as a blip or becomes an outage.
-    static func lossesOutsideOutages(_ probes: [Probe]) -> Int {
-        var total = 0, run = 0
-        for p in probes {
-            if p.lost { run += 1 } else {
-                if run < outageRun { total += run }
-                run = 0
+    /// The nearest stop that is slow compared with its own normal.
+    static func locateSlowness(_ s: Snapshot) -> StopRole {
+        for stop in s.stops where stop.role != .internet {
+            let recent = recentAnswered(stop.role, s).suffix(3).compactMap(\.ms)
+            if recent.count >= 3, let slow = s.baseline(stop.role).slowThresholdMs, let m = median(recent), m > slow {
+                return stop.role
             }
         }
-        return total
+        return .internet
+    }
+
+    static func recentAnswered(_ role: StopRole, _ s: Snapshot) -> [Probe] {
+        Array(s.probes.filter { $0.role == role && !$0.lost && s.now.timeIntervalSince($0.time) <= latencySpan }.suffix(5))
+    }
+
+    // MARK: - Wording
+
+    /// Numbers in a headline describe the place it names.
+    static func subject(_ role: StopRole, _ s: Snapshot) -> String {
+        switch role {
+        case .router: s.connection == .hotspot ? "Your connection to the phone" : "Your connection to the router"
+        case .upstream: "The link to the upstream router"
+        case .isp: "Your ISP's line"
+        case .internet: "The internet"
+        }
+    }
+
+    static func downHeadline(_ role: StopRole, _ s: Snapshot) -> String {
+        switch role {
+        case .router: s.connection == .hotspot ? "Can't reach your phone." : "Can't reach your router."
+        case .upstream: "Your router can't reach the upstream router."
+        case .isp: "Your ISP's line looks down."
+        case .internet: s.stops.contains { $0.role == .isp } ? "Nothing beyond your ISP is answering." : "The internet isn't answering."
+        }
+    }
+
+    static func whereDetail(_ role: StopRole, _ s: Snapshot, link: String) -> String {
+        switch role {
+        case .router:
+            // A silent or slow router can't tell the Mac's own link from the
+            // router or, in a mesh, the node relaying for it.
+            "Either your \(link) connection or the router itself. In a mesh, that includes the node this Mac connects through."
+        case .upstream:
+            "Your \(link) and router are fine. Likely the cable to the upstream router, or the router itself."
+        case .isp:
+            "Your \(link) and router are fine."
+        case .internet:
+            s.stops.contains { $0.role == .isp } ? "Your \(link), router and ISP's line look fine." : "Your \(link) and router look fine."
+        }
+    }
+
+    static func lossRuns(_ probes: [Probe]) -> Int {
+        zip([Probe?.none] + probes.map(Optional.some), probes).filter { prev, p in p.lost && !(prev?.lost ?? false) }.count
     }
 
     struct Blip {
@@ -185,7 +227,7 @@ public enum Evaluator {
     static func recentBlip(_ s: Snapshot, far: [Probe], threshold: Double?) -> Blip? {
         let window = { (t: Date) in s.now.timeIntervalSince(t) <= memory }
         if let o = s.outage, let end = o.end, window(end) {
-            return Blip(time: end, what: "The connection was down for \(Format.duration(o.duration(asOf: end))).")
+            return Blip(time: end, what: "Trouble lasted \(Format.duration(o.duration(asOf: end))).")
         }
         if let lost = far.last(where: { $0.lost && window($0.time) }) {
             return Blip(time: lost.time, what: "A few pings to the internet were lost.")

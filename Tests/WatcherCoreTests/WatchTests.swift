@@ -36,7 +36,7 @@ private struct Run {
 
     mutating func join(_ path: NetworkPath, place: Place? = nil, farSeed: [Double] = []) {
         send(.pathChanged(satisfied: true, connection: path.connection, signature: path.fingerprint ?? "", at: now))
-        send(.discovered(path, place: place, farSeed: farSeed, routerSeed: [], at: now))
+        send(.discovered(path, place: place, seeds: [.internet: farSeed], at: now))
     }
 
     func actions(since: Date? = nil, where match: (Watch.Action) -> Bool) -> [Watch.Action] {
@@ -94,7 +94,7 @@ struct WatchTests {
         r.network = { _, role in
             guard role == .internet else { return 5 }
             count += 1
-            return count % 4 == 0 ? nil : 40
+            return count % 5 == 0 ? nil : 40
         }
         r.join(cafe)
         r.run(5 * 60)
@@ -108,7 +108,7 @@ struct WatchTests {
         r.network = { _, role in
             guard role == .internet else { return 5 }
             count += 1
-            return count % 4 == 0 ? nil : 18
+            return count % 5 == 0 ? nil : 18
         }
         r.join(home, place: homePlace, farSeed: fiberSeed)
         r.run(4 * 60)
@@ -136,6 +136,81 @@ struct WatchTests {
         #expect(abs(o.end!.timeIntervalSince(backAt)) <= 1.5)
         #expect(o.startEarliest <= downFrom && o.startLatest >= downFrom)
         #expect(r.actions { if case .lightChanged(let a) = $0 { a.light == .red } else { false } }.count == 1)
+    }
+
+    /// Runs of lost pings with a few answers between them are one stretch of
+    /// trouble: one outage, one notification.
+    @Test func repeatedDropoutsAreOneOutage() {
+        var r = Run()
+        let start = r.now
+        let badFrom = start.addingTimeInterval(60), badUntil = start.addingTimeInterval(15 * 60)
+        r.network = { t, role in
+            let cycle = Int(t.timeIntervalSince(start)) % 8
+            return t >= badFrom && t < badUntil && cycle < 5 ? nil : (role == .internet ? 18 : 5)
+        }
+        r.join(home, place: homePlace, farSeed: fiberSeed)
+        r.run(16 * 60)
+        // Once the loss stops, red stops within about five pings at the normal pace.
+        #expect(r.watch.assessment.light < .red)
+        r.run(9 * 60)
+        let ended = r.actions { if case .outageEnded = $0 { true } else { false } }
+        #expect(ended.count == 1)
+        #expect(r.actions { if case .recordOutage = $0 { true } else { false } }.count == 1)
+        guard case .outageEnded(let o) = ended.first else { return }
+        #expect(o.startLatest >= badFrom && o.startEarliest < badFrom.addingTimeInterval(30))
+        #expect(abs(o.end!.timeIntervalSince(badUntil)) <= 20)
+        #expect(r.watch.assessment.light == .green)
+    }
+
+    @Test func anOutageFromSlownessEndsWhenLatencyRecovers() {
+        var r = Run()
+        let start = r.now
+        let slowFrom = start.addingTimeInterval(60), slowUntil = start.addingTimeInterval(660)
+        r.network = { t, role in role == .internet && t >= slowFrom && t < slowUntil ? 900 : (role == .internet ? 18 : 5) }
+        r.join(home, place: homePlace, farSeed: fiberSeed)
+        r.run(15 * 60)
+        let ended = r.actions { if case .outageEnded = $0 { true } else { false } }
+        #expect(ended.count == 1)
+        guard case .outageEnded(let o) = ended.first else { return }
+        #expect(abs(o.end!.timeIntervalSince(slowUntil)) <= 15)
+        #expect(o.duration(asOf: o.end!) > 9 * 60)
+    }
+
+    @Test func aNewOutageDoesNotStartInsideTheLastOne() {
+        var r = Run()
+        let start = r.now
+        let down: [(TimeInterval, TimeInterval)] = [(120, 420), (520, 560)]
+        r.network = { t, role in
+            let s = t.timeIntervalSince(start)
+            return role == .internet && down.contains { s >= $0.0 && s < $0.1 } ? nil : (role == .internet ? 18 : 5)
+        }
+        r.join(home, place: homePlace, farSeed: fiberSeed)
+        r.run(15 * 60)
+        let outages = r.actions { if case .recordOutage = $0 { true } else { false } }.compactMap {
+            if case .recordOutage(let o, _) = $0 { o } else { nil }
+        }
+        #expect(outages.count == 2)
+        guard outages.count == 2 else { return }
+        #expect(outages[1].startEarliest >= outages[0].end!)
+        #expect(outages[1].duration(asOf: outages[1].end!) < 60)
+    }
+
+    /// Joining a network that is already down must not learn the outage as normal loss.
+    @Test func lossDuringTroubleIsNotLearnedAsNormal() {
+        var r = Run()
+        var routerCount = 0
+        r.network = { _, role in
+            switch role {
+            case .internet: return nil
+            case .router:
+                routerCount += 1
+                return routerCount % 97 == 0 ? nil : 5
+            default: return 9
+            }
+        }
+        r.join(cafe)
+        r.run(5 * 60)
+        #expect(r.watch.assessment.headline == "Nothing beyond your ISP is answering.")
     }
 
     @Test func sleepingDuringAnOutageRecordsItWithoutAnnouncingItsEnd() {

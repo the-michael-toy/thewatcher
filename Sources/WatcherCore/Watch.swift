@@ -11,6 +11,8 @@ public struct Watch: Sendable {
     static let fastPaceCap: TimeInterval = 3 * 60
     static let quietStopRediscovery: TimeInterval = 5 * 60
     static let captiveRecheck: TimeInterval = 30
+    /// Red returning this soon after it stopped continues the same outage.
+    static let outageGrace: TimeInterval = 60
 
     public private(set) var assessment = Assessment(light: .gray, headline: "Starting…", detail: nil, wantsFastPace: false)
     public private(set) var path: NetworkPath?
@@ -19,8 +21,8 @@ public struct Watch: Sendable {
     public private(set) var probes: [Probe] = []
     public private(set) var traffic: [TrafficSample] = []
     public private(set) var outage: Outage?
-    public private(set) var farBaseline = Baseline()
-    public private(set) var routerBaseline = Baseline()
+    public private(set) var baselines: [StopRole: Baseline] = [:]
+    public var farBaseline: Baseline { baselines[.internet] ?? Baseline() }
 
     private var awake = true
     private var connected = false
@@ -33,15 +35,19 @@ public struct Watch: Sendable {
     private var lastDiscovery = Date.distantPast
     private var lastCaptiveCheck = Date.distantPast
     private var minute: MinuteAccumulator?
+    /// While an outage waits out its grace period: when red stopped, and when
+    /// the trouble itself ended, which is the outage's end if red stays away.
+    private var redStopped: (at: Date, troubleEnded: Date)?
 
     public init() {}
 
     public enum Event: Sendable {
         case tick(Date)
         case pathChanged(satisfied: Bool, connection: Connection, signature: String, at: Date)
-        /// Discovery finished. `place`, and the latency seeds from its recent
-        /// history, are nil and empty for a network that isn't kept.
-        case discovered(NetworkPath?, place: Place?, farSeed: [Double], routerSeed: [Double], at: Date)
+        /// Discovery finished. `place`, and the pings from its recent history
+        /// that seed each stop's baseline, are nil and empty for a network that
+        /// isn't kept.
+        case discovered(NetworkPath?, place: Place?, seeds: [StopRole: [Double?]], at: Date)
         /// A ping sent on `network` (its router fingerprint) came back or timed out.
         case probe(Probe, network: String?, at: Date)
         case traffic(TrafficSample)
@@ -84,7 +90,7 @@ public struct Watch: Sendable {
                     lastDiscovery = now
                     actions.append(.discover(path.connection))
                 }
-                if (assessment.light == .red || captive), now.timeIntervalSince(lastCaptiveCheck) > Self.captiveRecheck {
+                if (nothingAnswering || captive), now.timeIntervalSince(lastCaptiveCheck) > Self.captiveRecheck {
                     lastCaptiveCheck = now
                     actions.append(.checkCaptive)
                 }
@@ -106,14 +112,13 @@ public struct Watch: Sendable {
             }
             assess(now, &actions)
 
-        case .discovered(let found, let kept, let farSeed, let routerSeed, let now):
+        case .discovered(let found, let kept, let seeds, let now):
             guard awake else { return [] }
             let sameNetwork = found?.fingerprint != nil && found?.fingerprint == path?.fingerprint
             if !sameNetwork {
                 leaveNetwork(now, &actions)
                 place = kept
-                farBaseline = Baseline(samples: farSeed)
-                routerBaseline = Baseline(samples: routerSeed)
+                baselines = seeds.mapValues { Baseline(pings: $0) }
             }
             path = found
             captive = false
@@ -162,10 +167,7 @@ public struct Watch: Sendable {
             if place?.id == id { place = nil }
 
         case .relearn(let id, let now):
-            if place?.id == id {
-                farBaseline = Baseline()
-                routerBaseline = Baseline()
-            }
+            if place?.id == id { baselines = [:] }
             assess(now, &actions)
         }
         return actions
@@ -192,6 +194,11 @@ public struct Watch: Sendable {
         return now.timeIntervalSince(last) >= interval - 0.05
     }
 
+    /// A login page shows up as the internet not answering at all.
+    private var nothingAnswering: Bool {
+        probes.filter { $0.role == .internet }.reversed().prefix(while: \.lost).count >= Evaluator.outageRun
+    }
+
     /// A middle stop going silent while the internet still answers means the
     /// route moved, not that something broke.
     private func quietStopMoved(_ now: Date) -> Bool {
@@ -210,16 +217,14 @@ public struct Watch: Sendable {
     /// A new place learns its first samples whatever they are, so a link that
     /// is always slow becomes its own normal. After that, latency measured
     /// during trouble is kept out of what counts as normal.
+    /// Loss is only ever learned outside trouble, so an outage present when
+    /// joining a network isn't taken for that network's normal.
     private mutating func learn(_ probe: Probe) {
-        guard let ms = probe.ms else { return }
-        switch probe.role {
-        case .internet where !farBaseline.isLearned || assessment.light < .orange:
-            farBaseline.add(ms)
-        case .router where !routerBaseline.isLearned || assessment.light < .orange:
-            routerBaseline.add(ms)
-        default:
-            break
-        }
+        var baseline = baselines[probe.role] ?? Baseline()
+        let duringTrouble = assessment.light >= .orange
+        guard !duringTrouble || (!baseline.isLearned && !probe.lost) else { return }
+        baseline.add(probe.ms)
+        baselines[probe.role] = baseline
     }
 
     // MARK: - Assessment and outages
@@ -228,30 +233,48 @@ public struct Watch: Sendable {
         let next = Evaluator.assess(Snapshot(
             now: now, connected: connected && awake, captive: captive,
             connection: path?.connection ?? connection, stops: path?.stops ?? [],
-            probes: probes, traffic: traffic, farBaseline: farBaseline, routerBaseline: routerBaseline,
-            outage: outage))
-        trackOutage(next.light, now, &actions)
+            probes: probes, traffic: traffic, baselines: baselines, outage: outage))
+        trackOutage(next, now, &actions)
         if let m = minute, next.light > m.worstLight { minute?.worstLight = next.light }
         if next.light != assessment.light { actions.append(.lightChanged(next)) }
         assessment = next
     }
 
-    private mutating func trackOutage(_ light: Light, _ now: Date, _ actions: inout [Action]) {
+    private mutating func trackOutage(_ a: Assessment, _ now: Date, _ actions: inout [Action]) {
+        let light = a.light
         let ongoing = outage.map { $0.end == nil } ?? false
-        if light == .red && !ongoing {
-            let far = probes.filter { $0.role == .internet }
-            guard let firstLost = far.reversed().prefix(while: \.lost).last else { return }
-            let lastGood = far.last { !$0.lost }?.time ?? firstLost.time.addingTimeInterval(-10)
-            outage = Outage(startEarliest: lastGood, startLatest: firstLost.time).narrowed(by: traffic)
-        } else if ongoing && light != .red && light != .gray {
-            let back = probes.last { $0.role == .internet && !$0.lost }?.time ?? now
-            closeOutage(at: back, notify: true, &actions)
+        if light == .red {
+            redStopped = nil
+            guard !ongoing else { return }
+            // Trouble still in the window from the previous outage isn't this one's start.
+            var started = a.troubleStarted ?? now
+            if let previous = outage?.end, started < previous {
+                started = probes.first { isBad($0) && $0.time > previous }?.time ?? now
+            }
+            let before = probes.last { $0.role == .internet && $0.time < started }?.time ?? started.addingTimeInterval(-10)
+            outage = Outage(startEarliest: before, startLatest: started).narrowed(by: traffic)
+        } else if ongoing && light != .gray {
+            let stopped = redStopped ?? (now, troubleEnded(now))
+            redStopped = stopped
+            if now.timeIntervalSince(stopped.at) >= Self.outageGrace { closeOutage(at: now, notify: true, &actions) }
         }
     }
 
+    /// An internet probe that was lost or very slow.
+    private func isBad(_ p: Probe) -> Bool {
+        p.role == .internet && (p.lost || (p.ms ?? 0) > (farBaseline.verySlowThresholdMs ?? .infinity))
+    }
+
+    /// The first internet probe after the last bad one.
+    private func troubleEnded(_ now: Date) -> Date {
+        let lastBad = probes.last(where: isBad)?.time ?? .distantPast
+        return probes.first { $0.role == .internet && $0.time > lastBad }?.time ?? now
+    }
+
     private mutating func closeOutage(at end: Date, notify: Bool, _ actions: inout [Action]) {
+        defer { redStopped = nil }
         guard var o = outage, o.end == nil else { return }
-        o.end = max(end, o.startLatest)
+        o.end = max(redStopped?.troubleEnded ?? end, o.startLatest)
         outage = o
         if let place { actions.append(.recordOutage(o, place)) }
         if notify { actions.append(.outageEnded(o)) }
@@ -266,8 +289,7 @@ public struct Watch: Sendable {
         place = nil
         probes = []
         traffic = []
-        farBaseline = Baseline()
-        routerBaseline = Baseline()
+        baselines = [:]
         lastSent = [:]
         fastSince = nil
         fastSpent = false

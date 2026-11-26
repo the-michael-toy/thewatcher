@@ -23,8 +23,8 @@ enum Notifier {
     static func outageEnded(_ outage: Outage) {
         guard Settings.notifyOnRecovery, let end = outage.end else { return }
         let content = UNMutableNotificationContent()
-        content.title = "The internet is back"
-        content.body = "It was down for about \(Format.duration(outage.duration(asOf: end)))."
+        content.title = "The outage is over"
+        content.body = "It lasted about \(Format.duration(outage.duration(asOf: end)))."
         let request = UNNotificationRequest(identifier: UUID().uuidString, content: content, trigger: nil)
         UNUserNotificationCenter.current().add(request)
     }

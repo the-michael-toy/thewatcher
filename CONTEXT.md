@@ -16,14 +16,17 @@ minutes, ordered by urgency:
   confirmed. It fades back to green after five clean minutes. A glance at
   yellow says "you're not crazy, something happened, it's over."
 - **Orange:** going south right now. Pings are slow compared with this place's
-  normal, or scattered pings are being lost.
-- **Red:** nothing is getting through.
+  normal, or some are being lost.
+- **Red:** significant problems between this Mac and the internet: nothing
+  getting through, a quarter or more of pings lost, or ten times the usual
+  latency. The panel says which.
 - **Hollow gray:** not connected, or waiting at a network login page. Neither
   is the internet failing.
 
 **The panel**, opened by clicking the dot, answers "what's up". It leads with
-one sentence saying what's wrong and where ("Your ISP's line looks down. Your
-Wi-Fi and router are fine. Down for 2m 13s."). Below that is a live view of the
+one sentence saying where the trouble starts and what it is, with numbers about
+that place ("Your connection to the router is losing 15 of the last 20 pings."),
+then a line saying what that place covers ("Your Wi-Fi and router are fine."). Below that is a live view of the
 last 15 minutes: one strip per stop on the path, a "Your apps" strip for resend
 bursts in the Mac's own traffic, and a latency chart against the usual latency.
 The footer names the place, has "More details…", and a gear menu with Settings
@@ -41,8 +44,8 @@ and Quit. The panel's view exists only while it's open.
 
 **Settings:**
 
-- A checkbox for one notification when an outage ends. Nothing is sent when
-  one starts.
+- A checkbox for one notification when an outage (a red stretch) ends.
+  Nothing is sent when one starts.
 - Open at login. The installed app asks once, at first launch.
 - The list of kept places, plus "Keep history here" when the current network
   isn't kept. Each place can be renamed, forgotten, or re-learned. Re-learning
@@ -111,35 +114,48 @@ If the kernel refuses access, the traffic monitor simply doesn't exist, the
 ## How the dot is decided
 
 `Evaluator.assess` is a pure function over a snapshot. Only the internet probes
-set the color; the other stops explain where a problem starts.
+set the color; the other stops explain where a problem starts. Loss is judged
+over one window: the last 20 internet probes within 3 minutes.
 
-- **Red:** the last three internet probes were all lost.
-- **Orange:** either of these:
-  - At least two lost pings among the last 20 internet probes (within 3
-    minutes), not counting losses that belong to an outage run.
-  - The median of the last five successful probes is above this place's slow
-    threshold.
+- **Losing pings:** the window holds more than one run of lost probes, and one
+  of the last five probes was lost. Every lost probe counts. A single run that
+  has ended is a blip, not ongoing loss.
+- **Slow:** the median of the last five answered probes within 2 minutes is
+  above this place's slow threshold.
+- **Red:** the last three probes were all lost; or pings are being lost and a
+  quarter or more of the window was lost; or slow beyond the very-slow
+  threshold.
+- **Orange:** losing pings or slow, short of red. When both apply, the worse
+  one speaks, and loss wins a tie.
 - **Yellow:** either of these:
   - One or two trailing lost probes (unconfirmed).
   - Within the last 5 minutes: a lost probe, a spike over the threshold, a lost
     router ping, a resend burst, or an outage that ended.
+- **What's normal** is learned per stop and per place: round trips from the
+  last 600 answered pings, and the share of the last 600 pings lost. Nothing
+  counts as slow until 20 answers exist. Those first 20 answers are learned
+  whatever they are, so a link that is always slow becomes its own normal.
+  Otherwise pings taken while the dot is orange or red are kept out, lost
+  ones always, and so are stored
+  pings from minutes that were orange or red when a kept place's normal is
+  loaded from history.
 - **Slow threshold:** `max(2.5 × median, median + 4 × (p90 − median), median +
-  50 ms)`, learned per place from the last 600 good samples. Nothing counts as
-  slow until 20 samples exist. Those first 20 are learned whatever they are,
-  so a link that is always slow becomes its own normal. After that, samples
-  taken while the dot is orange or red are kept out of the baseline.
-- **Locating the problem:**
-  - Red is placed at the nearest stop losing at least half the pings sent
-    since the internet stopped answering. Pings from before the outage don't
-    count.
-  - Orange loss is placed at the nearest stop losing at a comparable rate over
-    the same stretch of time.
-  - Slowness is placed at the router hop when the router itself is slow
-    compared with its own baseline.
+  50 ms)`. **Very slow:** `max(10 × median, 2 × slow threshold)`.
+- **Locating the problem:** every symptom goes to the nearest stop showing it
+  beyond that stop's own normal, over the same stretch of time.
+  - Loss: a stop whose loss, minus what it usually loses, is at least half the
+    internet's loss. For "nothing gets through" the stretch starts when the
+    internet stopped answering; otherwise it is the window.
+  - Slowness: a stop whose last three answers have a median above its own
+    slow threshold.
   - A silent or slow router means either the Mac's own link or the router
     itself. In a mesh, the router stop is the main node, and the node the Mac
-    talks to relays without showing up on the path. The text names both and
-    never blames the link alone.
+    talks to relays without showing up on the path, so the text names it too.
+- **Outages** are red stretches. Red returning within a minute of stopping
+  continues the same outage, so repeated dropouts are one outage with one
+  notification. It ends at the first internet probe after the last one that
+  was lost or very slow. An outage never starts before the previous one
+  ended.
 
 ## Places and history
 
@@ -168,7 +184,8 @@ History lives in SQLite at `~/Library/Application Support/TheWatcher/history.sql
   automatically.
 - **One-minute summaries:** kept forever. Each holds pings sent and lost,
   median and maximum latency, resends, and the worst color.
-- **Outages:** kept forever, each stored as a start range plus an end.
+- **Outages** (red stretches): kept forever, each stored as a start range plus
+  an end.
 
 Time away from a place (lid closed, at another network) is unwatched. It never
 counts as up or down. Moving to another network discards the live measurements

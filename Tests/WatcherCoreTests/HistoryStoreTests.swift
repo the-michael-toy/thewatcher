@@ -45,6 +45,21 @@ struct HistoryStoreTests {
         store.pruneRaw(now: now)
         let left = store.probes(place: home, from: now.addingTimeInterval(-30 * 24 * 3600), to: now)
         #expect(left.map(\.ms) == [12])
-        #expect(store.recentLatencies(place: home, role: .internet, limit: 10) == [12])
+        #expect(store.recentPings(place: home, role: .internet, limit: 10) == [12])
+    }
+
+    @Test func troubleIsNotSeededAsNormal() throws {
+        let store = try makeStore()
+        let home = try #require(store.addPlace(fingerprint: "aa:bb", name: "Home"))
+        let calm = Date(timeIntervalSince1970: 6_000_000), bad = calm.addingTimeInterval(60)
+        for (minute, light) in [(calm, Light.green), (bad, .red)] {
+            store.record(minute: MinuteSummary(minute: Int64(minute.timeIntervalSince1970 / 60), farSent: 6, farLost: 0,
+                                               farMedianMs: 17, farMaxMs: 20, resentBytes: 0, worstLight: light), place: home)
+        }
+        store.record(probe: Probe(time: calm.addingTimeInterval(5), role: .isp, ms: 9), place: home)
+        store.record(probe: Probe(time: calm.addingTimeInterval(35), role: .isp, ms: nil), place: home)
+        store.record(probe: Probe(time: bad.addingTimeInterval(5), role: .isp, ms: 400), place: home)
+        store.record(probe: Probe(time: bad.addingTimeInterval(35), role: .isp, ms: nil), place: home)
+        #expect(store.recentPings(place: home, role: .isp, limit: 10) == [9, nil])
     }
 }

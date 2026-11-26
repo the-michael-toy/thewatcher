@@ -120,7 +120,7 @@ private struct Strips: View {
     }
 
     private func drawProbes(_ probes: [Probe], role: StopRole, ctx: GraphicsContext, size: CGSize) {
-        let slow = (role == .internet ? monitor.farBaseline.slowThresholdMs : nil) ?? .infinity
+        let slow = monitor.baselines[role]?.slowThresholdMs ?? .infinity
         let longestGap: TimeInterval = role == .isp ? 35 : 15
         for (i, p) in probes.enumerated() {
             let next = i + 1 < probes.count ? probes[i + 1].time : now

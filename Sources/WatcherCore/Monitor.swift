@@ -22,6 +22,7 @@ public final class Monitor {
     public var place: Place? { watch.place }
     public var probes: [Probe] { watch.probes }
     public var traffic: [TrafficSample] { watch.traffic }
+    public var baselines: [StopRole: Baseline] { watch.baselines }
     public var farBaseline: Baseline { watch.farBaseline }
 
     /// Called when an outage ends while still on the same network.
@@ -159,7 +160,7 @@ public final class Monitor {
         case .outageEnded(let outage):
             onOutageEnded?(outage)
         case .lightChanged(let a):
-            log.notice("light \(String(describing: a.light), privacy: .public): \(a.headline, privacy: .public)")
+            log.notice("light \(String(describing: a.light), privacy: .public): \(a.headline, privacy: .public) \(a.detail ?? "", privacy: .public)")
         }
     }
 
@@ -190,9 +191,13 @@ public final class Monitor {
             let found = await PathDiscovery.discover(connection: connection)
             guard !Task.isCancelled, let self else { return }
             let kept = found?.fingerprint.flatMap { self.store?.place(fingerprint: $0) }
-            let farSeed = kept.map { self.store?.recentLatencies(place: $0, role: .internet, limit: Baseline.capacity) ?? [] } ?? []
-            let routerSeed = kept.map { self.store?.recentLatencies(place: $0, role: .router, limit: Baseline.capacity) ?? [] } ?? []
-            self.dispatch(.discovered(found, place: kept, farSeed: farSeed, routerSeed: routerSeed, at: Date()))
+            var seeds: [StopRole: [Double?]] = [:]
+            if let kept, let store = self.store {
+                for role in StopRole.allCases {
+                    seeds[role] = store.recentPings(place: kept, role: role, limit: Baseline.capacity)
+                }
+            }
+            self.dispatch(.discovered(found, place: kept, seeds: seeds, at: Date()))
             if let found {
                 let stops = found.stops.map { "\($0.role)=\($0.address?.description ?? "far")" }.joined(separator: " ")
                 log.notice("path: \(found.connection.rawValue, privacy: .public) via \(found.interface, privacy: .public), place \(kept?.name ?? "unknown", privacy: .public): \(stops, privacy: .public)")

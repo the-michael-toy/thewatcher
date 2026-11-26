@@ -11,7 +11,7 @@ struct SettingsView: View {
     var body: some View {
         Form {
             Section {
-                Toggle("Notify me when the internet comes back after an outage", isOn: $notifyOnRecovery)
+                Toggle("Notify me when an outage ends", isOn: $notifyOnRecovery)
                     .onChange(of: notifyOnRecovery) { _, on in if on { Notifier.requestPermission() } }
                 Toggle("Open TheWatcher at login", isOn: $openAtLogin)
                     .onChange(of: openAtLogin) { _, on in LoginItem.set(on) }

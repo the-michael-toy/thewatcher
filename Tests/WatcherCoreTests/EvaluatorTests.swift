@@ -13,9 +13,11 @@ struct EvaluatorTests {
         ms.enumerated().map { i, v in Probe(time: now.addingTimeInterval(-Double(ms.count - 1 - i) * every), role: role, ms: v) }
     }
 
-    func snapshot(_ probes: [Probe], baseline: Baseline? = nil, traffic: [TrafficSample] = [], outage: Outage? = nil) -> Snapshot {
-        Snapshot(now: now, stops: stops, probes: probes.sorted { $0.time < $1.time }, traffic: traffic,
-                 farBaseline: baseline ?? fiber, routerBaseline: Baseline(samples: Array(repeating: 3, count: 50)), outage: outage)
+    func snapshot(_ probes: [Probe], baseline: Baseline? = nil, traffic: [TrafficSample] = [], outage: Outage? = nil,
+                  baselines: [StopRole: Baseline] = [:]) -> Snapshot {
+        let usual: [StopRole: Baseline] = [.internet: baseline ?? fiber, .router: Baseline(samples: Array(repeating: 3, count: 50))]
+        return Snapshot(now: now, stops: stops, probes: probes.sorted { $0.time < $1.time }, traffic: traffic,
+                        baselines: usual.merging(baselines) { $1 }, outage: outage)
     }
 
     @Test func steadyIsGreen() {
@@ -79,27 +81,62 @@ struct EvaluatorTests {
         let outage = Outage(startEarliest: now.addingTimeInterval(-5), startLatest: now.addingTimeInterval(-4), end: now)
         let a = Evaluator.assess(snapshot(probes, outage: outage))
         #expect(a.light == .yellow)
-        #expect(a.detail?.hasPrefix("The connection was down for") == true)
+        #expect(a.detail?.hasPrefix("Trouble lasted") == true)
     }
 
     @Test func scatteredLossIsOrange() {
         let ms: [Double?] = [17, nil, 17, 17, 17, nil, 17, 17, 17, 17, 17, nil, 17, 17, 17, 17]
         let a = Evaluator.assess(snapshot(series(.internet, ms) + series(.isp, ms.map { $0.map { _ in 9 } })))
         #expect(a.light == .orange)
-        #expect(a.headline.hasPrefix("Losing about 1 in"))
-        #expect(a.detail?.contains("ISP's line") == true)
+        #expect(a.headline == "Your ISP's line is losing 3 of the last 16 pings.")
     }
 
-    @Test func anOutageIsNotCountedAsScatteredLoss() {
-        #expect(Evaluator.lossesOutsideOutages(series(.internet, [17, nil, nil, nil, nil, 17, 17])) == 0)
-        #expect(Evaluator.lossesOutsideOutages(series(.internet, [17, nil, 17, nil, nil, 17])) == 3)
-        #expect(Evaluator.lossesOutsideOutages(series(.internet, [17, nil, 17, nil, nil])) == 1)
+    /// Heavy loss comes in runs of several pings; every lost ping counts.
+    @Test func heavyLossInRunsIsRedWithTheRealCount() {
+        let ms: [Double?] = [17, nil, 17, nil, nil, nil, nil, nil, nil, nil, nil, nil, nil, nil, nil, nil, 17, nil, 17, 17]
+        let probes = series(.internet, ms) + series(.router, ms.map { $0.map { _ in 3 } })
+        let a = Evaluator.assess(snapshot(probes))
+        #expect(a.light == .red)
+        #expect(a.headline == "Your connection to the router is losing 15 of the last 20 pings.")
+        #expect(a.detail?.contains("mesh") == true)
+    }
+
+    @Test func aStopsUsualLossIsNotBlamed() {
+        let far: [Double?] = [17, nil, 17, 17, 17, nil, 17, 17, 17, 17, nil, 17, 17, 17, 17, 17, nil, 17, 17, 17]
+        let isp: [Double?] = [9, 9, 9, nil, 9, 9, 9]
+        let dropsPingsWhenBusy = Baseline(pings: (0..<100).map { $0 % 10 == 0 ? nil : 9 })
+        let a = Evaluator.assess(snapshot(series(.internet, far) + series(.isp, isp, every: 3),
+                                          baselines: [.isp: dropsPingsWhenBusy]))
+        #expect(a.headline == "The internet is losing 4 of the last 20 pings.")
     }
 
     @Test func sustainedSlownessIsOrange() {
-        let a = Evaluator.assess(snapshot(series(.internet, Array(repeating: 17, count: 20) + [180, 190, 175, 200, 185])))
+        let a = Evaluator.assess(snapshot(series(.internet, Array(repeating: 17, count: 20) + [120, 130, 115, 140, 125])))
         #expect(a.light == .orange)
-        #expect(a.headline == "The internet is slow: 185 ms, usually 17 ms.")
+        #expect(a.headline == "The internet is slow: 125 ms, usually 17 ms.")
+    }
+
+    @Test func tenTimesUsualLatencyIsRed() {
+        let a = Evaluator.assess(snapshot(series(.internet, Array(repeating: 17, count: 20) + [420, 600, 410, 430, 426])))
+        #expect(a.light == .red)
+    }
+
+    @Test func severeSlownessIsNotHiddenByMildLoss() {
+        let ms: [Double?] = Array(repeating: 17, count: 12) + [nil, 420, 600, nil, 410, 430, 426, 415]
+        let a = Evaluator.assess(snapshot(series(.internet, ms)))
+        #expect(a.light == .red)
+        #expect(a.headline.hasPrefix("The internet is slow"))
+        #expect(a.wantsFastPace)
+    }
+
+    @Test func slownessIsPlacedAtTheNearestStopSlowForItself() {
+        let probes = series(.internet, Array(repeating: 17, count: 20) + [210, 220, 205, 215, 212])
+            + series(.router, Array(repeating: 3, count: 25))
+            + series(.upstream, Array(repeating: 5, count: 25))
+            + series(.isp, Array(repeating: 9, count: 20) + [200, 205, 199, 210, 204])
+        let a = Evaluator.assess(snapshot(probes, baselines: [.upstream: Baseline(samples: Array(repeating: 5, count: 50)),
+                                                              .isp: Baseline(samples: Array(repeating: 9, count: 50))]))
+        #expect(a.headline == "Your ISP's line is slow: 204 ms, usually 9.0 ms.")
     }
 
     @Test func satelliteSwingIsNormalThere() {

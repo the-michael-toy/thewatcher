@@ -171,13 +171,20 @@ public final class HistoryStore: @unchecked Sendable {
         }
     }
 
-    /// The most recent successful round trips to one stop since the place's
-    /// baseline was last reset, oldest first.
-    public func recentLatencies(place: Place, role: StopRole, limit: Int) -> [Double] {
+    /// The most recent pings to one stop since the place's baseline was last
+    /// reset, oldest first: round trips, nil for lost. Pings from minutes that
+    /// were orange or red are left out; trouble isn't what's normal here.
+    public func recentPings(place: Place, role: StopRole, limit: Int) -> [Double?] {
         let since = place.baselineSince?.timeIntervalSince1970 ?? 0
-        return query("SELECT ms FROM probes WHERE place = ? AND role = ? AND ms IS NOT NULL AND ts >= ? ORDER BY ts DESC LIMIT ?",
-              [.int(place.id), .int(Int64(role.rawValue)), .real(since), .int(Int64(limit))]) { st in
-            sqlite3_column_double(st, 0)
+        return query("""
+            SELECT ms FROM probes p WHERE place = ? AND role = ? AND ts >= ?
+              AND NOT EXISTS (SELECT 1 FROM minutes m
+                              WHERE m.place = p.place AND m.minute = CAST(p.ts / 60 AS INTEGER) AND m.light >= ?)
+            ORDER BY ts DESC LIMIT ?
+            """,
+              [.int(place.id), .int(Int64(role.rawValue)), .real(since), .int(Int64(Light.orange.rawValue)),
+               .int(Int64(limit))]) { st in
+            sqlite3_column_type(st, 0) == SQLITE_NULL ? nil : sqlite3_column_double(st, 0)
         }.reversed()
     }
 
